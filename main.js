@@ -1,96 +1,105 @@
 'use strict';
 
-const bodyParser = require('body-parser');
-const express = require('express');
-const fs = require('fs');
-const morgan = require('morgan');
-const path = require('path');
-const winston = require('winston');
+const cluster = require('cluster');
 
-function logDirExists (dir) {
-  try {
-    fs.accessSync(dir);
-  } catch (e) {
-    return false;
+if (cluster.isMaster) {
+  const os = require('os');
+
+  for (let i = 0; i < os.cpus().length; ++i) {
+    cluster.fork();
   }
-  return true;
-}
+} else {
+  const fs = require('fs');
+  const http = require('http');
+  const morgan = require('morgan');
+  const path = require('path');
+  const winston = require('winston');
 
-let logDir = process.env.LOG_DIR;
-if (logDir === undefined) {
-  logDir = path.join(__dirname, 'logs');
-}
-if (!logDirExists(logDir)) {
-  fs.mkdirSync(logDir);
-}
+  const createApp = require('./app.js');
+  const authenticate = require('./middleware/authentication.js');
 
-const logger = new winston.Logger({
-  transports: [
-    new winston.transports.File({ filename: path.join(logDir, 'combined.log') })
-  ]
-});
+  function fileExists (file) {
+    try {
+      fs.accessSync(file);
+    } catch (e) {
+      return false;
+    }
+    return true;
+  }
 
-logger.info('Bootstrapping application...');
-const app = express();
+  let logDir = process.env.LOG_DIR;
+  if (logDir === undefined) {
+    logDir = path.join(__dirname, 'logs');
+  }
+  if (!fileExists(logDir)) {
+    fs.mkdirSync(logDir);
+  }
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: false }));
+  const logger = new winston.Logger({
+    transports: [
+      new winston.transports.File({ filename: path.join(logDir, 'combined.log') })
+    ]
+  });
 
-const accessLogStream = fs.createWriteStream(
-  path.join(logDir, 'access.log'),
-  { flags: 'a' }
-);
-accessLogStream.on('close', () => logger.info('Access log stream closed.'));
-logger.info(`Opened access log stream "${path.join(logDir, 'access.log')}".`);
-app.use(morgan('combined', { stream: accessLogStream }));
+  logger.info('Bootstrapping application.');
 
-app.post('/', (req, res) => {
-  if (req.body.text === undefined) {
-    res.json({
-      text: 'You gave me some invalid parameters. Please try again.'
-    });
+  const configFileName = path.join(__dirname, 'server-config.json');
+  if (!fileExists(configFileName)) {
+    logger.error('Could not find "server-config.json". A "server-config.json" file must be created before using this application.');
     return;
   }
+  let config = fs.readFileSync(path.join(__dirname, 'server-config.json'));
+  config = (function () {
+    let val = null;
+    try {
+      val = JSON.parse(config);
+    } catch (e) {
+      val = null;
+    }
+    return val;
+  }());
+  if (config === null) {
+    logger.error('Error while parsing "server-config.json".');
+    process.exit(1);
+  }
+  logger.info('Loaded "server-config.json".');
 
-  let [ numDie, sides ] = req.body.text.split('d');
-  numDie = parseInt(numDie, 10);
-  sides = parseInt(sides, 10);
-  if (
-    !Number.isInteger(numDie)
-    || !Number.isInteger(sides)
-  ) {
-    res.json({
-      text: 'You gave me some invalid parameters. Please try again.'
+  const accessLogStream = fs.createWriteStream(
+    path.join(logDir, 'access.log'),
+    { flags: 'a' }
+  );
+  const accessLogger = morgan('combined', { stream: accessLogStream });
+
+  const authenticator = authenticate({
+    logger,
+    token: config.apptoken
+  });
+
+  const middleWare = [
+    accessLogger,
+    authenticator
+  ];
+  const app = createApp(logger, middleWare);
+
+  const server = http.createServer(app)
+    .listen(8480, '127.0.0.1');
+  server.on('listening', () => logger.info('Server listening on port 8480'));
+
+  function gracefulShutdown () {
+    logger.info('Received shutdown signal.');
+    server.close(() => {
+      logger.info('Server closed.');
+      accessLogStream.end();
+      process.exit();
     });
-    return;
+    setTimeout(() => {
+      logger.error('Failed to close server in a timely manner. Force quit.');
+      accessLogStream.end();
+      process.exit();
+    }, 10000);
   }
 
-  let roll = 0;
-  for (let i = 0; i < numDie; ++i) {
-    roll = roll + Math.floor(Math.random() * sides + 1);
-  }
-  res.json({
-    text: `@user rolled ${numDie}d${sides} and got ${roll}`
-  });
-});
-logger.info('Registered routes.');
-
-const server = app.listen(8480, () => logger.info('Server listening on port 8480'));
-
-function gracefulShutdown () {
-  logger.info('Received shutdown signal.');
-  server.close(() => {
-    logger.info('Server closed.');
-    accessLogStream.end();
-    process.exit();
-  });
-  setTimeout(() => {
-    logger.error('Failed to close server in a timely manner. Force quit.');
-    accessLogStream.end();
-    process.exit();
-  }, 10000);
+  process.on('SIGTERM', gracefulShutdown);
+  process.on('SIGINT', gracefulShutdown);
 }
-
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
 
