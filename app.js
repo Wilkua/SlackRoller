@@ -19,10 +19,19 @@ const createApp = (winston, middleWare) => {
   });
 
   app.post('/', (req, res) => {
+    if (req.body.ssl_check !== undefined) {
+      res.status(200);
+      res.end();
+      return;
+    }
+
+    const badParamResponse = {
+      text: 'Oops! Seems like you gave me some incorrect parameters.',
+      attachments: [{ text: 'Try /roll 3d6' }]
+    };
+
     if (req.body.text === undefined) {
-      res.json({
-        text: 'You gave me some invalid parameters. Please try again.'
-      });
+      res.json(badParamResponse);
       return;
     }
 
@@ -33,9 +42,7 @@ const createApp = (winston, middleWare) => {
       !Number.isInteger(numDie)
       || !Number.isInteger(sides)
     ) {
-      res.json({
-        text: 'You gave me some invalid parameters. Please try again.'
-      });
+      res.json(badParamResponse);
       return;
     }
 
@@ -43,8 +50,10 @@ const createApp = (winston, middleWare) => {
     for (let i = 0; i < numDie; ++i) {
       roll = roll + Math.floor(Math.random() * sides + 1);
     }
+
     res.json({
-      text: `@user rolled ${numDie}d${sides} and got ${roll}`
+      response_type: 'in_channel',
+      text: `<@${req.body.user_id}> rolled ${numDie}d${sides} and got ${roll}`
     });
   });
   winston.info('Registered routes.');
